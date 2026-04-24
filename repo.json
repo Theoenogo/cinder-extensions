@@ -26,7 +26,7 @@
 			"version": "1.0.0",
 			"description": "Read manga, manhwa, and manhua from WeebCentral.com",
 			"contentType": "manga",
-			"scriptUrl": "https://raw.githubusercontent.com/TrexxyMon/Cinder-Extensions/main/weebcentral.js",
+			"scriptUrl": "https://raw.githubusercontent.com/Theoenogo/cinder-extensions/main/repo.json",
 			"minCinderVersion": "2.0.0"
 		}
 	]
