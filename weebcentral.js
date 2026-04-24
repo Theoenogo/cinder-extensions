@@ -4,7 +4,7 @@
 __cinderExport = {
 	id: "weebcentral",
 	name: "WeebCentral",
-	version: "1.0.5",
+	version: "1.0.6",
 	icon: "📚",
 	description: "Read manga, manhwa, and manhua from WeebCentral.com",
 	contentType: "manga",
