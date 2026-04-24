@@ -23,7 +23,7 @@
 		{
 			"id": "weebcentral",
 			"name": "WeebCentral",
-			"version": "1.0.5",
+			"version": "1.0.6",
 			"description": "Read manga, manhwa, and manhua from WeebCentral.com",
 			"contentType": "manga",
 			"scriptUrl": "https://raw.githubusercontent.com/Theoenogo/cinder-extensions/main/weebcentral.js",
