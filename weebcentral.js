@@ -4,15 +4,15 @@
 // Uses HTML scraping since WeebCentral has no public JSON API.
 //
 // URL patterns:
-//   Search:        https://weebcentral.com/search?text={query}&limit=20&official=Any&display_mode=Minimal%20Display&sort=Best+Match&order=Ascending&status=Any&type=Any
-//   Series:        https://weebcentral.com/series/{ULID}
-//   Chapter list:  https://weebcentral.com/series/{ULID}/full-chapter-list
-//   Chapter:       https://weebcentral.com/chapters/{ULID}
+//   Search:       https://weebcentral.com/search?text={query}&...
+//   Series:       https://weebcentral.com/series/{ULID}
+//   Chapter list: https://weebcentral.com/series/{ULID}/full-chapter-list
+//   Chapter:      https://weebcentral.com/chapters/{ULID}
 
 __cinderExport = {
 	id: "weebcentral",
 	name: "WeebCentral",
-	version: "1.0.0",
+	version: "1.0.1",
 	icon: "📚",
 	description: "Read manga, manhwa, and manhua from WeebCentral.com",
 	contentType: "manga",
@@ -29,110 +29,109 @@ __cinderExport = {
 
 	// ── HTML Parsing Helpers ─────────────────────────────────
 
-	// Extract all regex matches with a capture group from a string
-	_matchAll(html, regex) {
-		const results = [];
-		let match;
-		const re = new RegExp(regex.source, regex.flags.includes('g') ? regex.flags : regex.flags + 'g');
+	// Find all matches — takes pattern and flags as plain strings
+	_matchAll: function(html, patternStr, flags) {
+		var results = [];
+		var re = new RegExp(patternStr, flags || "gi");
+		var match;
 		while ((match = re.exec(html)) !== null) {
 			results.push(match);
 		}
 		return results;
 	},
 
-	// Extract the first match of a capture group, or a fallback
-	_match(html, regex, fallback = "") {
-		const m = regex.exec(html);
+	// Return first capture group, or fallback
+	_match: function(html, patternStr, flags, fallback) {
+		if (fallback === undefined) { fallback = ""; }
+		var re = new RegExp(patternStr, flags || "i");
+		var m = re.exec(html);
 		return m ? m[1].trim() : fallback;
 	},
 
 	// Decode common HTML entities
-	_decode(str) {
+	_decode: function(str) {
 		return str
 			.replace(/&amp;/g, "&")
 			.replace(/&lt;/g, "<")
 			.replace(/&gt;/g, ">")
 			.replace(/&quot;/g, '"')
 			.replace(/&#039;/g, "'")
-			.replace(/&apos;/g, "'")
-			.replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)));
+			.replace(/&apos;/g, "'");
 	},
 
-	// Strip all HTML tags from a string
-	_stripTags(str) {
+	// Strip all HTML tags
+	_stripTags: function(str) {
 		return str.replace(/<[^>]*>/g, "").trim();
 	},
 
 	// Extract series ULID from a /series/ URL
-	_seriesIdFromUrl(url) {
-		const m = /\/series\/([A-Z0-9]+)/i.exec(url);
+	_seriesIdFromUrl: function(url) {
+		var m = /\/series\/([A-Z0-9]{20,})/i.exec(url);
 		return m ? m[1] : null;
 	},
 
 	// Extract chapter ULID from a /chapters/ URL
-	_chapterIdFromUrl(url) {
-		const m = /\/chapters\/([A-Z0-9]+)/i.exec(url);
+	_chapterIdFromUrl: function(url) {
+		var m = /\/chapters\/([A-Z0-9]{20,})/i.exec(url);
 		return m ? m[1] : null;
 	},
 
 	// ── Search ───────────────────────────────────────────────
 
-	async search(query, page = 1) {
-		const limit = 20;
-		const offset = (Math.max(1, page) - 1) * limit;
+	search: async function(query, page) {
+		if (page === undefined) { page = 1; }
+		var limit = 20;
+		var offset = (Math.max(1, page) - 1) * limit;
 
-		const url =
-			`${this.BASE_URL}/search?text=${encodeURIComponent(query)}` +
-			`&limit=${limit}&offset=${offset}` +
-			`&official=Any&display_mode=Minimal%20Display` +
-			`&sort=Best+Match&order=Ascending&status=Any&type=Any`;
+		var url =
+			this.BASE_URL + "/search?text=" + encodeURIComponent(query) +
+			"&limit=" + limit + "&offset=" + offset +
+			"&official=Any&display_mode=Minimal%20Display" +
+			"&sort=Best+Match&order=Ascending&status=Any&type=Any";
 
-		const res = await cinder.fetch(url, {
-			headers: { "User-Agent": "CinderApp/2.0 (iOS; Cinder)" },
+		var res = await cinder.fetch(url, {
+			headers: { "User-Agent": "CinderApp/2.0 (iOS; Cinder)" }
 		});
 
 		if (res.status !== 200) {
-			cinder.error("WeebCentral search failed:", res.status);
+			cinder.error("WeebCentral search failed: " + res.status);
 			return [];
 		}
 
 		return this._parseSearchResults(res.data);
 	},
 
-	_parseSearchResults(html) {
-		const results = [];
+	_parseSearchResults: function(html) {
+		var results = [];
+		var seen = {};
 
-		// Each series card is an <a> element linking to /series/{ID}
-		// Pattern: <a ... href="/series/ULID/slug-title" ...>...<img ... src="cover_url">...<span ...>Title</span>
-		const cardRegex = /<a[^>]+href="(\/series\/[A-Z0-9]+[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
-		const cards = this._matchAll(html, cardRegex);
+		var cards = this._matchAll(
+			html,
+			'<a[^>]+href="(\\/series\\/[A-Z0-9]{20,}[^"]*)"[^>]*>([\\s\\S]*?)<\\/a>',
+			"gi"
+		);
 
-		for (const card of cards) {
-			const [, href, inner] = card;
+		for (var i = 0; i < cards.length; i++) {
+			var href = cards[i][1];
+			var inner = cards[i][2];
 
-			// Skip non-series links (navigation etc.)
-			if (!/\/series\/[A-Z0-9]{20,}/i.test(href)) continue;
+			var id = this._seriesIdFromUrl(href);
+			if (!id || seen[id]) { continue; }
+			seen[id] = true;
 
-			const id = this._seriesIdFromUrl(href);
-			if (!id) continue;
+			var coverMatch = /src="([^"]+(?:jpg|jpeg|png|webp)[^"]*)"/.exec(inner);
+			var cover = coverMatch ? coverMatch[1] : undefined;
 
-			// Cover image
-			const coverMatch = /src="([^"]+(?:jpg|jpeg|png|webp)[^"]*)"/.exec(inner);
-			const cover = coverMatch ? coverMatch[1] : undefined;
-
-			// Title — try <span> or alt text
-			const titleFromSpan = this._match(inner, /<span[^>]*>\s*([^<]{2,})\s*<\/span>/i);
-			const titleFromAlt = this._match(inner, /alt="([^"]+)"/i);
-			const title = this._decode(titleFromSpan || titleFromAlt || "Unknown Title");
-
-			if (title === "Unknown Title" && !cover) continue;
+			var titleFromSpan = this._match(inner, "<span[^>]*>\\s*([^<]{2,})\\s*<\\/span>", "i", "");
+			var titleFromAlt = this._match(inner, 'alt="([^"]+)"', "i", "");
+			var title = this._decode(titleFromSpan || titleFromAlt || "Unknown Title");
 
 			results.push({
-				id,
-				title,
-				cover,
-				url: `${this.BASE_URL}/series/${id}`,
-				format: "manga",
+				id: id,
+				title: title,
+				cover: cover,
+				url: this.BASE_URL + "/series/" + id,
+				format: "manga"
 			});
 		}
 
@@ -141,196 +140,204 @@ __cinderExport = {
 
 	// ── Discover ─────────────────────────────────────────────
 
-	async getDiscoverSections() {
+	getDiscoverSections: async function() {
 		return [
-			{ id: "hot-weekly",   title: "Hot This Week",  icon: "🔥" },
-			{ id: "hot-monthly",  title: "Hot This Month", icon: "📈" },
-			{ id: "hot-alltime",  title: "All-Time Popular", icon: "⭐" },
-			{ id: "latest",       title: "Latest Updates", icon: "🆕" },
+			{ id: "hot-weekly",  title: "Hot This Week",    icon: "🔥" },
+			{ id: "hot-monthly", title: "Hot This Month",   icon: "📈" },
+			{ id: "hot-alltime", title: "All-Time Popular", icon: "⭐" },
+			{ id: "latest",      title: "Latest Updates",   icon: "🆕" }
 		];
 	},
 
-	async getDiscoverItems(sectionId, page = 0) {
-		const limit = 20;
-		const offset = page * limit;
+	getDiscoverItems: async function(sectionId, page) {
+		if (page === undefined) { page = 0; }
+		var limit = 20;
+		var offset = page * limit;
+		var url;
 
-		let url;
 		if (sectionId === "latest") {
 			url =
-				`${this.BASE_URL}/search?text=` +
-				`&limit=${limit}&offset=${offset}` +
-				`&official=Any&display_mode=Minimal%20Display` +
-				`&sort=Latest+Updates&order=Descending&status=Any&type=Any`;
+				this.BASE_URL + "/search?text=" +
+				"&limit=" + limit + "&offset=" + offset +
+				"&official=Any&display_mode=Minimal%20Display" +
+				"&sort=Latest+Updates&order=Descending&status=Any&type=Any";
 		} else {
-			// WeebCentral has a /series/trending page that returns weekly/monthly/all-time
-			const period =
-				sectionId === "hot-weekly"  ? "weekly"  :
-				sectionId === "hot-monthly" ? "monthly" : "all_time";
-			url = `${this.BASE_URL}/series/trending?period=${period}&limit=${limit}&offset=${offset}`;
+			var period =
+				sectionId === "hot-weekly"  ? "weekly"   :
+				sectionId === "hot-monthly" ? "monthly"  : "all_time";
+			url = this.BASE_URL + "/series/trending?period=" + period +
+			      "&limit=" + limit + "&offset=" + offset;
 		}
 
-		const res = await cinder.fetch(url, {
-			headers: { "User-Agent": "CinderApp/2.0 (iOS; Cinder)" },
+		var res = await cinder.fetch(url, {
+			headers: { "User-Agent": "CinderApp/2.0 (iOS; Cinder)" }
 		});
 
-		if (res.status !== 200) return [];
+		if (res.status !== 200) { return []; }
 		return this._parseSearchResults(res.data);
 	},
 
 	// ── Manga Details ─────────────────────────────────────────
 
-	async getMangaDetails(id) {
-		const url = `${this.BASE_URL}/series/${id}`;
+	getMangaDetails: async function(id) {
+		var url = this.BASE_URL + "/series/" + id;
 
-		const res = await cinder.fetch(url, {
-			headers: { "User-Agent": "CinderApp/2.0 (iOS; Cinder)" },
+		var res = await cinder.fetch(url, {
+			headers: { "User-Agent": "CinderApp/2.0 (iOS; Cinder)" }
 		});
 
-		if (res.status !== 200) throw new Error(`Failed to fetch series page: ${res.status}`);
+		if (res.status !== 200) {
+			throw new Error("Failed to fetch series page: " + res.status);
+		}
 
-		const html = res.data;
+		var html = res.data;
 
-		// Title — usually in <h1> or <title>
-		const title = this._decode(
-			this._match(html, /<h1[^>]*>\s*([^<]+)\s*<\/h1>/i) ||
-			this._match(html, /<title>\s*([^|<]+?)(?:\s*[|–-].*)?<\/title>/i) ||
+		var title = this._decode(
+			this._match(html, "<h1[^>]*>\\s*([^<]+)\\s*<\\/h1>", "i", "") ||
+			this._match(html, "<title>\\s*([^|<]+?)(?:\\s*[|].*)?<\\/title>", "i", "") ||
 			"Unknown"
 		);
 
-		// Cover image
-		const cover = this._match(html, /<img[^>]+id="[^"]*cover[^"]*"[^>]+src="([^"]+)"/i) ||
-		              this._match(html, /<img[^>]+class="[^"]*cover[^"]*"[^>]+src="([^"]+)"/i) ||
-		              this._match(html, /src="(https:\/\/[^"]+(?:cover|thumb)[^"]*(?:jpg|jpeg|png|webp))"/i);
+		var cover =
+			this._match(html, '<img[^>]+id="[^"]*cover[^"]*"[^>]+src="([^"]+)"', "i", "") ||
+			this._match(html, '<img[^>]+class="[^"]*cover[^"]*"[^>]+src="([^"]+)"', "i", "") ||
+			this._match(html, "src=\"(https:\\/\\/[^\"]+(?:cover|thumb)[^\"]*(?:jpg|jpeg|png|webp))\"", "i", "");
 
-		// Description
-		const descRaw = this._match(html, /<p[^>]*class="[^"]*description[^"]*"[^>]*>([\s\S]*?)<\/p>/i) ||
-		                this._match(html, /<div[^>]*class="[^"]*synopsis[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-		const description = descRaw ? this._decode(this._stripTags(descRaw)) : "";
+		var descRaw =
+			this._match(html, '<p[^>]*class="[^"]*description[^"]*"[^>]*>([\\s\\S]*?)<\\/p>', "i", "") ||
+			this._match(html, '<div[^>]*class="[^"]*synopsis[^"]*"[^>]*>([\\s\\S]*?)<\\/div>', "i", "");
+		var description = descRaw ? this._decode(this._stripTags(descRaw)) : "";
 
-		// Status
-		const status = this._match(html, /(?:Status|Ongoing|Completed)[^>]*>\s*<[^>]+>\s*([^<]+)/i);
-
-		// Author
-		const author = this._decode(
-			this._match(html, /(?:Author|Authors?)[^>]*>\s*(?:<[^>]+>)?\s*([^<]{2,})/i)
+		var status = this._match(html, "Status[^>]*>\\s*(?:<[^>]+>)?\\s*([^<]{2,30})", "i", "");
+		var author = this._decode(
+			this._match(html, "Author[^>]*>\\s*(?:<[^>]+>)?\\s*([^<]{2,60})", "i", "")
 		);
 
-		// Genres — extract all <a> tags inside a genres/tags container
-		const genreBlock = this._match(html, /(?:Genres?|Tags?)[^>]*>([\s\S]*?)(?:<\/(?:div|ul|section)>)/i);
-		const genres = genreBlock
-			? this._matchAll(genreBlock, /<a[^>]*>([^<]+)<\/a>/i).map(m => this._decode(m[1].trim()))
+		var genreBlock =
+			this._match(html, "Genres?[^>]*>([\\s\\S]*?)(?:<\\/(?:div|ul|section)>)", "i", "");
+		var genreMatches = genreBlock
+			? this._matchAll(genreBlock, "<a[^>]*>([^<]+)<\\/a>", "gi")
 			: [];
+		var genres = [];
+		for (var g = 0; g < genreMatches.length; g++) {
+			genres.push(this._decode(genreMatches[g][1].trim()));
+		}
 
 		return {
-			id,
-			title,
+			id: id,
+			title: title,
 			cover: cover || undefined,
-			description,
+			description: description,
 			author: author || undefined,
 			status: status ? status.toLowerCase().trim() : undefined,
-			genres,
+			genres: genres
 		};
 	},
 
 	// ── Chapters ─────────────────────────────────────────────
 
-	async getChapters(seriesId) {
-		// WeebCentral provides a dedicated full chapter list endpoint
-		const url = `${this.BASE_URL}/series/${seriesId}/full-chapter-list`;
+	getChapters: async function(seriesId) {
+		var url = this.BASE_URL + "/series/" + seriesId + "/full-chapter-list";
 
-		const res = await cinder.fetch(url, {
+		var res = await cinder.fetch(url, {
 			headers: {
 				"User-Agent": "CinderApp/2.0 (iOS; Cinder)",
-				// The full-chapter-list endpoint may be an HTMX partial — hint that we accept HTML
-				"Accept": "text/html, */*",
-			},
+				"Accept": "text/html, */*"
+			}
 		});
 
-		if (res.status !== 200) throw new Error(`Failed to fetch chapter list: ${res.status}`);
+		if (res.status !== 200) {
+			throw new Error("Failed to fetch chapter list: " + res.status);
+		}
 
-		return this._parseChapterList(res.data, seriesId);
+		return this._parseChapterList(res.data);
 	},
 
-	_parseChapterList(html, seriesId) {
-		const chapters = [];
+	_parseChapterList: function(html) {
+		var chapters = [];
 
-		// Each chapter row: <a href="/chapters/{ULID}" ...>
-		const rowRegex = /<a[^>]+href="(\/chapters\/[A-Z0-9]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-		const rows = this._matchAll(html, rowRegex);
+		var rows = this._matchAll(
+			html,
+			'<a[^>]+href="(\\/chapters\\/[A-Z0-9]{20,})"[^>]*>([\\s\\S]*?)<\\/a>',
+			"gi"
+		);
 
-		for (const row of rows) {
-			const [, href, inner] = row;
+		for (var i = 0; i < rows.length; i++) {
+			var href = rows[i][1];
+			var inner = rows[i][2];
 
-			const chapterId = this._chapterIdFromUrl(href);
-			if (!chapterId) continue;
+			var chapterId = this._chapterIdFromUrl(href);
+			if (!chapterId) { continue; }
 
-			// Chapter number — look for patterns like "Chapter 42" or just "42" or "42.5"
-			const numStr =
-				this._match(inner, /Chapter\s+([\d.]+)/i) ||
-				this._match(inner, /Ch\.?\s*([\d.]+)/i) ||
-				this._match(inner, />([\d.]+)<\//) ||
+			var numStr =
+				this._match(inner, "Chapter\\s+([\\d.]+)", "i", "") ||
+				this._match(inner, "Ch\\.?\\s*([\\d.]+)", "i", "") ||
+				this._match(inner, ">([\\d.]+)<\\/", "i", "") ||
 				"0";
-			const chapterNumber = parseFloat(numStr) || 0;
+			var chapterNumber = parseFloat(numStr) || 0;
 
-			// Title — may include a named chapter title after the number
-			const rawTitle = this._decode(this._stripTags(inner)).replace(/\s+/g, " ").trim();
-			const title = rawTitle || `Chapter ${numStr}`;
+			var rawTitle = this._decode(this._stripTags(inner)).replace(/\s+/g, " ").trim();
+			var title = rawTitle || ("Chapter " + numStr);
 
-			// Upload date — ISO date strings like 2024-01-15
-			const dateStr = this._match(inner, /(\d{4}-\d{2}-\d{2})/);
+			var dateStr = this._match(inner, "(\\d{4}-\\d{2}-\\d{2})", "i", "");
 
 			chapters.push({
 				id: chapterId,
-				title,
-				chapterNumber,
-				dateUploaded: dateStr || undefined,
+				title: title,
+				chapterNumber: chapterNumber,
+				dateUploaded: dateStr || undefined
 			});
 		}
 
-		// WeebCentral lists chapters newest-first; reverse so chapterNumber ascends
-		return chapters.reverse();
+		chapters.reverse();
+		return chapters;
 	},
 
 	// ── Pages ─────────────────────────────────────────────────
 
-	async getPages(chapterId) {
-		const url = `${this.BASE_URL}/chapters/${chapterId}`;
+	getPages: async function(chapterId) {
+		var url = this.BASE_URL + "/chapters/" + chapterId;
 
-		const res = await cinder.fetch(url, {
-			headers: { "User-Agent": "CinderApp/2.0 (iOS; Cinder)" },
+		var res = await cinder.fetch(url, {
+			headers: { "User-Agent": "CinderApp/2.0 (iOS; Cinder)" }
 		});
 
-		if (res.status !== 200) throw new Error(`Failed to fetch chapter: ${res.status}`);
+		if (res.status !== 200) {
+			throw new Error("Failed to fetch chapter: " + res.status);
+		}
 
 		return this._parsePages(res.data);
 	},
 
-	_parsePages(html) {
-		const pages = [];
-		const seen = new Set();
+	_parsePages: function(html) {
+		var pages = [];
+		var seen = {};
 
-		// WeebCentral renders chapter images as <img> tags.
-		// They are typically served from a CDN like images.weebcentral.com
-		// Look for <img> tags inside the chapter reader container.
-		const imgRegex = /<img[^>]+src="(https:\/\/(?:images\.weebcentral\.com|cdn\.[^"]+)[^"]+(?:jpg|jpeg|png|webp)[^"]*)"/gi;
-		const matches = this._matchAll(html, imgRegex);
+		var matches = this._matchAll(
+			html,
+			'<img[^>]+src="(https:\\/\\/(?:images\\.weebcentral\\.com|cdn\\.[^"]+)[^"]+(?:jpg|jpeg|png|webp)[^"]*)"',
+			"gi"
+		);
 
-		for (const m of matches) {
-			const imgUrl = m[1];
-			if (seen.has(imgUrl)) continue;
-			seen.add(imgUrl);
+		for (var i = 0; i < matches.length; i++) {
+			var imgUrl = matches[i][1];
+			if (seen[imgUrl]) { continue; }
+			seen[imgUrl] = true;
 			pages.push({ url: imgUrl });
 		}
 
-		// Fallback: try data-src (lazy-loaded images)
+		// Fallback: lazy-loaded data-src
 		if (pages.length === 0) {
-			const lazySrcRegex = /<img[^>]+data-src="(https:\/\/[^"]+(?:jpg|jpeg|png|webp)[^"]*)"/gi;
-			const lazyMatches = this._matchAll(html, lazySrcRegex);
-			for (const m of lazyMatches) {
-				const imgUrl = m[1];
-				if (seen.has(imgUrl)) continue;
-				seen.add(imgUrl);
-				pages.push({ url: imgUrl });
+			var lazy = this._matchAll(
+				html,
+				'<img[^>]+data-src="(https:\\/\\/[^"]+(?:jpg|jpeg|png|webp)[^"]*)"',
+				"gi"
+			);
+			for (var j = 0; j < lazy.length; j++) {
+				var lazyUrl = lazy[j][1];
+				if (seen[lazyUrl]) { continue; }
+				seen[lazyUrl] = true;
+				pages.push({ url: lazyUrl });
 			}
 		}
 
@@ -339,7 +346,7 @@ __cinderExport = {
 
 	// ── Settings ─────────────────────────────────────────────
 
-	getSettings() {
+	getSettings: function() {
 		return [
 			{
 				id: "content_type",
@@ -350,8 +357,8 @@ __cinderExport = {
 					{ label: "All",     value: "Any"    },
 					{ label: "Manga",   value: "Manga"  },
 					{ label: "Manhwa",  value: "Manhwa" },
-					{ label: "Manhua",  value: "Manhua" },
-				],
+					{ label: "Manhua",  value: "Manhua" }
+				]
 			},
 			{
 				id: "sort_order",
@@ -359,12 +366,11 @@ __cinderExport = {
 				type: "select",
 				defaultValue: "Best Match",
 				options: [
-					{ label: "Best Match",     value: "Best+Match"    },
+					{ label: "Best Match",     value: "Best+Match"     },
 					{ label: "Latest Updates", value: "Latest+Updates" },
-					{ label: "Oldest",         value: "Oldest"        },
-					{ label: "Most Popular",   value: "Most+Popular"  },
-				],
-			},
+					{ label: "Most Popular",   value: "Most+Popular"   }
+				]
+			}
 		];
-	},
+	}
 };
