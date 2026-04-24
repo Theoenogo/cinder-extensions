@@ -4,7 +4,7 @@
 __cinderExport = {
 	id: "weebcentral",
 	name: "WeebCentral",
-	version: "1.0.4",
+	version: "1.0.5",
 	icon: "📚",
 	description: "Read manga, manhwa, and manhua from WeebCentral.com",
 	contentType: "manga",
@@ -256,58 +256,48 @@ __cinderExport = {
 	},
 
 	_parseChapterList(html) {
-		const chapters = [];
+    const chapters = [];
 
-		const rows = this._matchAll(
-			html,
-			'href="https://weebcentral\\.com/chapters/([A-Z0-9]{20,})"[^>]*>([\\s\\S]*?)<\\/a>',
-			"gi"
-		);
+    const rows = this._matchAll(
+        html,
+        'href="https://weebcentral\\.com/chapters/([A-Z0-9]{20,})"[^>]*>([\\s\\S]*?)<\\/a>',
+        "gi"
+    );
 
-		for (const row of rows) {
-			const chapterId = row[1];
-			const inner = row[2];
+    for (const row of rows) {
+        const chapterId = row[1];
+        const inner = row[2];
 
-			const numStr = this._match(inner, '<span[^>]*>\\s*Chapter\\s+([\\d.]+)\\s*<\\/span>', "i", "0");
-			const chapterNumber = parseFloat(numStr) || 0;
+        // Try "Chapter 42" format first
+        let numStr = this._match(inner, '<span[^>]*>\\s*Chapter\\s+([\\d.]+)\\s*<\\/span>', "i", "");
 
-			const dateStr = this._match(inner, 'datetime="([^"]+)"', "i", "");
+        // Fallback: grab any standalone number from the visible text
+        if (!numStr) {
+            const text = this._decode(this._stripTags(inner)).trim();
+            const m = /(?:Chapter|Ch\.?)\s*([\d.]+)/i.exec(text);
+            if (m) {
+                numStr = m[1];
+            } else {
+                const m2 = /([\d.]+)/.exec(text);
+                if (m2) { numStr = m2[1]; }
+            }
+        }
 
-			chapters.push({
-				id: chapterId,
-				title: "Chapter " + (numStr || "?"),
-				chapterNumber: chapterNumber,
-				dateUploaded: dateStr || undefined,
-			});
-		}
+        const chapterNumber = parseFloat(numStr) || 0;
+        const dateStr = this._match(inner, 'datetime="([^"]+)"', "i", "");
 
-		chapters.reverse();
-		return chapters;
-	},
+        chapters.push({
+            id: chapterId,
+            title: "Chapter " + (numStr || "?"),
+            chapterNumber: chapterNumber,
+            dateUploaded: dateStr || undefined,
+        });
+    }
 
-	// --- Pages ---
-	// Images are loaded via a separate HTMX endpoint, not the chapter page itself.
-	// URL pattern confirmed from page source:
-	// /chapters/{id}/images?is_prev=False&current_page=1&reading_style=long_strip
+    chapters.reverse();
+    return chapters;
+},
 
-	async getPages(chapterId) {
-		const url = this.BASE_URL + "/chapters/" + chapterId +
-			"/images?is_prev=False&current_page=1&reading_style=long_strip";
-
-		const res = await cinder.fetch(url, {
-			headers: {
-				"User-Agent": "CinderApp/2.0 (iOS; Cinder)",
-				"HX-Request": "true",
-				"Accept": "text/html, */*",
-			}
-		});
-
-		if (res.status !== 200) {
-			throw new Error("Failed to fetch pages: " + res.status);
-		}
-
-		return this._parsePages(res.data);
-	},
 
 	_parsePages(html) {
 		const pages = [];
