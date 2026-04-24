@@ -1,11 +1,10 @@
 // WeebCentral Extension for Cinder
 // Manga, manhwa, and manhua from WeebCentral.com
-// Uses HTML scraping - no public JSON API available.
 
 __cinderExport = {
 	id: "weebcentral",
 	name: "WeebCentral",
-	version: "1.0.2",
+	version: "1.0.3",
 	icon: "📚",
 	description: "Read manga, manhwa, and manhua from WeebCentral.com",
 	contentType: "manga",
@@ -19,9 +18,14 @@ __cinderExport = {
 	},
 
 	BASE_URL: "https://weebcentral.com",
+	COVER_URL: "https://temp.compsci88.com/cover/fallback/",
 
-	// --- Helpers ---
+	// Cover URLs follow a simple pattern — construct directly from series ULID
+	_coverUrl(id) {
+		return this.COVER_URL + id + ".jpg";
+	},
 
+	// Find all regex matches, returns array of match arrays
 	_matchAll(html, patternStr, flags) {
 		const results = [];
 		const re = new RegExp(patternStr, flags || "gi");
@@ -32,6 +36,7 @@ __cinderExport = {
 		return results;
 	},
 
+	// Return first capture group or fallback
 	_match(html, patternStr, flags, fallback = "") {
 		const re = new RegExp(patternStr, flags || "i");
 		const m = re.exec(html);
@@ -63,56 +68,94 @@ __cinderExport = {
 	},
 
 	// --- Search ---
+	// WeebCentral quick search uses POST to /search/simple
+	// Full search page uses GET /search?text=...
+	// We try POST first (same endpoint the site uses) then fall back to GET
 
 	async search(query, page = 1) {
 		const limit = 20;
 		const offset = (Math.max(1, page) - 1) * limit;
-		const url =
+
+		// Try the simple search POST endpoint (used by the site's own quick search)
+		const res = await cinder.fetch(
+			this.BASE_URL + "/search/simple?location=main&limit=" + limit + "&offset=" + offset,
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/x-www-form-urlencoded",
+					"User-Agent": "CinderApp/2.0 (iOS; Cinder)",
+					"HX-Request": "true",
+				},
+				body: "text=" + encodeURIComponent(query),
+			}
+		);
+
+		if (res.status === 200 && res.data && res.data.length > 10) {
+			const results = this._parseSearchResults(res.data);
+			if (results.length > 0) { return results; }
+		}
+
+		// Fallback: GET /search?text=...
+		const fallback = await cinder.fetch(
 			this.BASE_URL + "/search?text=" + encodeURIComponent(query) +
 			"&limit=" + limit + "&offset=" + offset +
-			"&official=Any&display_mode=Minimal%20Display" +
-			"&sort=Best+Match&order=Ascending&status=Any&type=Any";
+			"&official=Any&display_mode=Minimal%20Display&sort=Best+Match&order=Ascending&status=Any&type=Any",
+			{
+				headers: { "User-Agent": "CinderApp/2.0 (iOS; Cinder)" }
+			}
+		);
 
-		const res = await cinder.fetch(url, {
-			headers: { "User-Agent": "CinderApp/2.0 (iOS; Cinder)" }
-		});
-
-		if (res.status !== 200) {
-			cinder.error("WeebCentral search failed: " + res.status);
+		if (fallback.status !== 200) {
+			cinder.error("WeebCentral search failed: " + fallback.status);
 			return [];
 		}
 
-		return this._parseSearchResults(res.data);
+		return this._parseSearchResults(fallback.data);
 	},
 
 	_parseSearchResults(html) {
 		const results = [];
 		const seen = {};
 
-		const cards = this._matchAll(
+		// Match all <a href="/series/ULID..."> links
+		const links = this._matchAll(
 			html,
-			'<a[^>]+href="(\\/series\\/[A-Z0-9]{20,}[^"]*)"[^>]*>([\\s\\S]*?)<\\/a>',
+			'href="(https?://weebcentral\\.com/series/([A-Z0-9]{20,})[^"]*)"',
 			"gi"
 		);
 
-		for (const card of cards) {
-			const href = card[1];
-			const inner = card[2];
-			const id = this._seriesIdFromUrl(href);
-			if (!id || seen[id]) { continue; }
+		for (const link of links) {
+			const href = link[1];
+			const id = link[2];
+			if (seen[id]) { continue; }
 			seen[id] = true;
 
-			const coverMatch = /src="([^"]+(?:jpg|jpeg|png|webp)[^"]*)"/.exec(inner);
-			const cover = coverMatch ? coverMatch[1] : undefined;
+			// Extract title from alt="TITLE cover" pattern on the nearby img tag
+			// Search a window of text around this href match
+			const pos = html.indexOf(link[0]);
+			const window = html.substring(pos, pos + 800);
 
-			const titleFromSpan = this._match(inner, "<span[^>]*>\\s*([^<]{2,})\\s*<\\/span>", "i", "");
-			const titleFromAlt = this._match(inner, 'alt="([^"]+)"', "i", "");
-			const title = this._decode(titleFromSpan || titleFromAlt || "Unknown Title");
+			// Try alt="Title cover" first (most reliable)
+			let title = this._match(window, 'alt="([^"]+)\\s+cover"', "i", "");
+
+			// Try title in a div with truncate class
+			if (!title) {
+				title = this._match(window, '<div[^>]*truncate[^>]*>([^<]{2,})<\\/div>', "i", "");
+			}
+
+			// Try any visible text as last resort
+			if (!title) {
+				title = this._decode(this._stripTags(window.substring(0, 200))).trim();
+				if (title.length > 100) { title = title.substring(0, 100); }
+			}
+
+			if (!title) { continue; }
+			title = this._decode(title.trim());
 
 			results.push({
 				id: id,
 				title: title,
-				cover: cover,
+				cover: this._coverUrl(id),
 				url: this.BASE_URL + "/series/" + id,
 				format: "manga",
 			});
@@ -125,31 +168,25 @@ __cinderExport = {
 
 	async getDiscoverSections() {
 		return [
+			{ id: "latest",      title: "Latest Updates",   icon: "🆕" },
 			{ id: "hot-weekly",  title: "Hot This Week",    icon: "🔥" },
 			{ id: "hot-monthly", title: "Hot This Month",   icon: "📈" },
 			{ id: "hot-alltime", title: "All-Time Popular", icon: "⭐" },
-			{ id: "latest",      title: "Latest Updates",   icon: "🆕" },
 		];
 	},
 
 	async getDiscoverItems(sectionId, page = 0) {
 		const limit = 20;
 		const offset = page * limit;
-		let url;
 
-		if (sectionId === "latest") {
-			url =
-				this.BASE_URL + "/search?text=" +
-				"&limit=" + limit + "&offset=" + offset +
-				"&official=Any&display_mode=Minimal%20Display" +
-				"&sort=Latest+Updates&order=Descending&status=Any&type=Any";
-		} else {
-			const period =
-				sectionId === "hot-weekly"  ? "weekly"  :
-				sectionId === "hot-monthly" ? "monthly" : "all_time";
-			url = this.BASE_URL + "/series/trending?period=" + period +
-			      "&limit=" + limit + "&offset=" + offset;
-		}
+		const sort = sectionId === "latest" ? "Latest+Updates" : "Most+Popular";
+		const order = sectionId === "latest" ? "Descending" : "Descending";
+
+		const url =
+			this.BASE_URL + "/search?text=" +
+			"&limit=" + limit + "&offset=" + offset +
+			"&official=Any&display_mode=Minimal%20Display" +
+			"&sort=" + sort + "&order=" + order + "&status=Any&type=Any";
 
 		const res = await cinder.fetch(url, {
 			headers: { "User-Agent": "CinderApp/2.0 (iOS; Cinder)" }
@@ -174,38 +211,46 @@ __cinderExport = {
 
 		const html = res.data;
 
+		// Title: <h1 class="...">One Piece</h1>
 		const title = this._decode(
-			this._match(html, "<h1[^>]*>\\s*([^<]+)\\s*<\\/h1>", "i", "") ||
-			this._match(html, "<title>\\s*([^|<]+?)(?:\\s*[|].*)?<\\/title>", "i", "") ||
-			"Unknown"
+			this._match(html, '<h1[^>]*>\\s*([^<]+?)\\s*<\\/h1>', "i", "Unknown")
 		);
 
-		const cover =
-			this._match(html, '<img[^>]+id="[^"]*cover[^"]*"[^>]+src="([^"]+)"', "i", "") ||
-			this._match(html, '<img[^>]+class="[^"]*cover[^"]*"[^>]+src="([^"]+)"', "i", "") ||
-			"";
+		// Cover: construct from ID directly
+		const cover = this._coverUrl(id);
 
-		const descRaw =
-			this._match(html, '<p[^>]*class="[^"]*description[^"]*"[^>]*>([\\s\\S]*?)<\\/p>', "i", "") ||
-			this._match(html, '<div[^>]*class="[^"]*synopsis[^"]*"[^>]*>([\\s\\S]*?)<\\/div>', "i", "");
+		// Description: <p class="whitespace-pre-wrap break-words">...</p>
+		const descRaw = this._match(
+			html,
+			'<p[^>]*whitespace-pre-wrap[^>]*>([\\s\\S]*?)<\\/p>',
+			"i",
+			""
+		);
 		const description = descRaw ? this._decode(this._stripTags(descRaw)) : "";
 
-		const status = this._match(html, "Status[^>]*>\\s*(?:<[^>]+>)?\\s*([^<]{2,30})", "i", "");
-		const author = this._decode(
-			this._match(html, "Author[^>]*>\\s*(?:<[^>]+>)?\\s*([^<]{2,60})", "i", "")
-		);
+		// Author: find "Author(s):" block then grab the first <a> text
+		const authorBlock = this._match(html, 'Author\\(s\\)[^<]*<\\/strong>([\\s\\S]*?)<\\/li>', "i", "");
+		const author = authorBlock
+			? this._decode(this._match(authorBlock, '>([^<]{2,})<\\/a>', "i", ""))
+			: "";
 
-		const genreBlock =
-			this._match(html, "Genres?[^>]*>([\\s\\S]*?)(?:<\\/(?:div|ul|section)>)", "i", "");
-		const genreMatches = genreBlock
-			? this._matchAll(genreBlock, "<a[^>]*>([^<]+)<\\/a>", "gi")
+		// Status: find "Status:" block then grab the <a> text
+		const statusBlock = this._match(html, '<strong>Status[^<]*<\\/strong>([\\s\\S]*?)<\\/li>', "i", "");
+		const status = statusBlock
+			? this._decode(this._match(statusBlock, '>([^<]{2,})<\\/a>', "i", ""))
+			: "";
+
+		// Tags: find "Tags(s):" block then grab all <a> texts
+		const tagsBlock = this._match(html, 'Tags\\(s\\)[^<]*<\\/strong>([\\s\\S]*?)<\\/li>', "i", "");
+		const tagMatches = tagsBlock
+			? this._matchAll(tagsBlock, '>([^<,]+)<\\/a>', "gi")
 			: [];
-		const genres = genreMatches.map(m => this._decode(m[1].trim()));
+		const genres = tagMatches.map(m => this._decode(m[1].trim()));
 
 		return {
 			id: id,
 			title: title,
-			cover: cover || undefined,
+			cover: cover,
 			description: description,
 			author: author || undefined,
 			status: status ? status.toLowerCase().trim() : undefined,
@@ -214,6 +259,8 @@ __cinderExport = {
 	},
 
 	// --- Chapters ---
+	// WeebCentral shows a truncated list on the series page.
+	// The /full-chapter-list endpoint returns the complete HTML list via HTMX.
 
 	async getChapters(seriesId) {
 		const url = this.BASE_URL + "/series/" + seriesId + "/full-chapter-list";
@@ -221,6 +268,7 @@ __cinderExport = {
 		const res = await cinder.fetch(url, {
 			headers: {
 				"User-Agent": "CinderApp/2.0 (iOS; Cinder)",
+				"HX-Request": "true",
 				"Accept": "text/html, */*",
 			}
 		});
@@ -235,26 +283,25 @@ __cinderExport = {
 	_parseChapterList(html) {
 		const chapters = [];
 
+		// Chapter links: <a href="https://weebcentral.com/chapters/ULID" class="...">
 		const rows = this._matchAll(
 			html,
-			'<a[^>]+href="(\\/chapters\\/[A-Z0-9]{20,})"[^>]*>([\\s\\S]*?)<\\/a>',
+			'href="https://weebcentral\\.com/chapters/([A-Z0-9]{20,})"[^>]*>([\\s\\S]*?)<\\/a>',
 			"gi"
 		);
 
 		for (const row of rows) {
-			const chapterId = this._chapterIdFromUrl(row[1]);
-			if (!chapterId) { continue; }
-
+			const chapterId = row[1];
 			const inner = row[2];
-			const numStr =
-				this._match(inner, "Chapter\\s+([\\d.]+)", "i", "") ||
-				this._match(inner, "Ch\\.?\\s*([\\d.]+)", "i", "") ||
-				"0";
+
+			// Chapter number: <span class="">Chapter 1181</span>
+			const numStr = this._match(inner, '<span[^>]*>\\s*Chapter\\s+([\\d.]+)\\s*<\\/span>', "i", "0");
 			const chapterNumber = parseFloat(numStr) || 0;
 
-			const rawTitle = this._decode(this._stripTags(inner)).replace(/\s+/g, " ").trim();
-			const title = rawTitle || ("Chapter " + numStr);
-			const dateStr = this._match(inner, "(\\d{4}-\\d{2}-\\d{2})", "i", "");
+			// Date: datetime="2026-04-24T12:02:31.353Z" on <time> tag
+			const dateStr = this._match(inner, 'datetime="([^"]+)"', "i", "");
+
+			const title = "Chapter " + (numStr || "?");
 
 			chapters.push({
 				id: chapterId,
@@ -264,6 +311,7 @@ __cinderExport = {
 			});
 		}
 
+		// full-chapter-list returns newest first — reverse to ascending
 		chapters.reverse();
 		return chapters;
 	},
@@ -288,31 +336,24 @@ __cinderExport = {
 		const pages = [];
 		const seen = {};
 
-		const matches = this._matchAll(
-			html,
-			'<img[^>]+src="(https:\\/\\/(?:images\\.weebcentral\\.com|cdn\\.[^"]+)[^"]+(?:jpg|jpeg|png|webp)[^"]*)"',
-			"gi"
-		);
+		// Images served from temp.compsci88.com CDN
+		// Match src="https://..." on <img> tags
+		const patterns = [
+			'<img[^>]+src="(https://[^"]+\\.(?:jpg|jpeg|png|webp)(?:\\?[^"]*)?)"',
+			'<img[^>]+data-src="(https://[^"]+\\.(?:jpg|jpeg|png|webp)(?:\\?[^"]*)?)"',
+		];
 
-		for (const m of matches) {
-			const imgUrl = m[1];
-			if (seen[imgUrl]) { continue; }
-			seen[imgUrl] = true;
-			pages.push({ url: imgUrl });
-		}
-
-		if (pages.length === 0) {
-			const lazy = this._matchAll(
-				html,
-				'<img[^>]+data-src="(https:\\/\\/[^"]+(?:jpg|jpeg|png|webp)[^"]*)"',
-				"gi"
-			);
-			for (const m of lazy) {
+		for (const pattern of patterns) {
+			const matches = this._matchAll(html, pattern, "gi");
+			for (const m of matches) {
 				const imgUrl = m[1];
+				// Skip small UI images (icons, logos etc.)
+				if (imgUrl.includes("/static/") || imgUrl.includes("favicon")) { continue; }
 				if (seen[imgUrl]) { continue; }
 				seen[imgUrl] = true;
 				pages.push({ url: imgUrl });
 			}
+			if (pages.length > 0) { break; }
 		}
 
 		return pages;
