@@ -70,7 +70,6 @@ __cinderExport = {
 		const limit = 20;
 		const offset = (Math.max(1, page) - 1) * limit;
 
-		// Try POST to the quick search endpoint the site itself uses
 		const res = await cinder.fetch(
 			this.BASE_URL + "/search/simple?location=main&limit=" + limit + "&offset=" + offset,
 			{
@@ -89,7 +88,6 @@ __cinderExport = {
 			if (results.length > 0) { return results; }
 		}
 
-		// Fallback: GET /search?text=...
 		const fallback = await cinder.fetch(
 			this.BASE_URL + "/search?text=" + encodeURIComponent(query) +
 			"&limit=" + limit + "&offset=" + offset +
@@ -163,13 +161,12 @@ __cinderExport = {
 		const offset = page * limit;
 
 		const sort = sectionId === "latest" ? "Latest+Updates" : "Most+Popular";
-		const order = "Descending";
 
 		const url =
 			this.BASE_URL + "/search?text=" +
 			"&limit=" + limit + "&offset=" + offset +
 			"&official=Any&display_mode=Minimal%20Display" +
-			"&sort=" + sort + "&order=" + order + "&status=Any&type=Any";
+			"&sort=" + sort + "&order=Descending&status=Any&type=Any";
 
 		const res = await cinder.fetch(url, {
 			headers: { "User-Agent": "CinderApp/2.0 (iOS; Cinder)" }
@@ -198,8 +195,6 @@ __cinderExport = {
 			this._match(html, '<h1[^>]*>\\s*([^<]+?)\\s*<\\/h1>', "i", "Unknown")
 		);
 
-		const cover = this._coverUrl(id);
-
 		const descRaw = this._match(
 			html,
 			'<p[^>]*whitespace-pre-wrap[^>]*>([\\s\\S]*?)<\\/p>',
@@ -227,7 +222,7 @@ __cinderExport = {
 		return {
 			id: id,
 			title: title,
-			cover: cover,
+			cover: this._coverUrl(id),
 			description: description,
 			author: author || undefined,
 			status: status ? status.toLowerCase().trim() : undefined,
@@ -256,55 +251,73 @@ __cinderExport = {
 	},
 
 	_parseChapterList(html) {
-    const chapters = [];
+		const chapters = [];
 
-    const rows = this._matchAll(
-        html,
-        'href="https://weebcentral\\.com/chapters/([A-Z0-9]{20,})"[^>]*>([\\s\\S]*?)<\\/a>',
-        "gi"
-    );
+		const rows = this._matchAll(
+			html,
+			'href="https://weebcentral\\.com/chapters/([A-Z0-9]{20,})"[^>]*>([\\s\\S]*?)<\\/a>',
+			"gi"
+		);
 
-    for (const row of rows) {
-        const chapterId = row[1];
-        const inner = row[2];
+		for (const row of rows) {
+			const chapterId = row[1];
+			const inner = row[2];
 
-        // Try "Chapter 42" format first
-        let numStr = this._match(inner, '<span[^>]*>\\s*Chapter\\s+([\\d.]+)\\s*<\\/span>', "i", "");
+			// Try "Chapter 42" inside a span first
+			let numStr = this._match(inner, '<span[^>]*>\\s*Chapter\\s+([\\d.]+)\\s*<\\/span>', "i", "");
 
-        // Fallback: grab any standalone number from the visible text
-        if (!numStr) {
-            const text = this._decode(this._stripTags(inner)).trim();
-            const m = /(?:Chapter|Ch\.?)\s*([\d.]+)/i.exec(text);
-            if (m) {
-                numStr = m[1];
-            } else {
-                const m2 = /([\d.]+)/.exec(text);
-                if (m2) { numStr = m2[1]; }
-            }
-        }
+			// Fallback: search the stripped text for any chapter number
+			if (!numStr) {
+				const text = this._decode(this._stripTags(inner)).trim();
+				const m = /(?:Chapter|Ch\.?)\s*([\d.]+)/i.exec(text);
+				if (m) {
+					numStr = m[1];
+				} else {
+					const m2 = /([\d.]+)/.exec(text);
+					if (m2) { numStr = m2[1]; }
+				}
+			}
 
-        const chapterNumber = parseFloat(numStr) || 0;
-        const dateStr = this._match(inner, 'datetime="([^"]+)"', "i", "");
+			const chapterNumber = parseFloat(numStr) || 0;
+			const dateStr = this._match(inner, 'datetime="([^"]+)"', "i", "");
 
-        chapters.push({
-            id: chapterId,
-            title: "Chapter " + (numStr || "?"),
-            chapterNumber: chapterNumber,
-            dateUploaded: dateStr || undefined,
-        });
-    }
+			chapters.push({
+				id: chapterId,
+				title: "Chapter " + (numStr || "?"),
+				chapterNumber: chapterNumber,
+				dateUploaded: dateStr || undefined,
+			});
+		}
 
-    chapters.reverse();
-    return chapters;
-},
+		chapters.reverse();
+		return chapters;
+	},
 
+	// --- Pages ---
+
+	async getPages(chapterId) {
+		const url = this.BASE_URL + "/chapters/" + chapterId +
+			"/images?is_prev=False&current_page=1&reading_style=long_strip";
+
+		const res = await cinder.fetch(url, {
+			headers: {
+				"User-Agent": "CinderApp/2.0 (iOS; Cinder)",
+				"HX-Request": "true",
+				"Accept": "text/html, */*",
+			}
+		});
+
+		if (res.status !== 200) {
+			throw new Error("Failed to fetch pages: " + res.status);
+		}
+
+		return this._parsePages(res.data);
+	},
 
 	_parsePages(html) {
 		const pages = [];
 		const seen = {};
 
-		// Images served from temp.compsci88.com/manga/...
-		// e.g. https://temp.compsci88.com/manga/One-Piece/1181-001.png
 		const patterns = [
 			'src="(https://temp\\.compsci88\\.com/manga/[^"]+)"',
 			'data-src="(https://temp\\.compsci88\\.com/manga/[^"]+)"',
