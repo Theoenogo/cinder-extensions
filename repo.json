@@ -14,7 +14,7 @@
 		{
 			"id": "batcave",
 			"name": "BatCave",
-			"version": "1.0.1",
+			"version": "1.0.2",
 			"description": "Read western comics from BatCave.biz",
 			"contentType": "comic",
 			"scriptUrl": "https://raw.githubusercontent.com/Theoenogo/cinder-extensions/main/batcave.js",
