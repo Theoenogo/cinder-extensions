@@ -1,18 +1,19 @@
 // BatCave Extension for Cinder
 // Western comics from BatCave.biz
-//
-// URL patterns:
-//   Search:      https://batcave.biz/search/{query}
-//   Series page: https://batcave.biz/{id}-{slug}.html
-//   Reader:      https://batcave.biz/reader/{series_id}/{chapter_id}
-//   Browse:      https://batcave.biz/comix/page/{n}/
 
-const MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+const DESKTOP_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+
+const BROWSER_HEADERS = {
+	"User-Agent": DESKTOP_UA,
+	"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+	"Accept-Language": "en-US,en;q=0.9",
+	"Referer": "https://batcave.biz/",
+};
 
 __cinderExport = {
 	id: "batcave",
 	name: "BatCave",
-	version: "1.0.2",
+	version: "1.0.3",
 	icon: "🦇",
 	description: "Read western comics from BatCave.biz",
 	contentType: "comic",
@@ -59,33 +60,48 @@ __cinderExport = {
 		return str.replace(/<[^>]*>/g, "").trim();
 	},
 
-	// Extract numeric series ID from slug e.g. "30310-batman" -> "30310"
 	_numericId(slug) {
 		const m = /^(\d+)/.exec(slug);
 		return m ? m[1] : slug;
 	},
 
-	// Make cover URL absolute
 	_absoluteUrl(url) {
 		if (!url) { return undefined; }
+		if (url.startsWith("data:")) { return undefined; }
 		if (url.startsWith("http")) { return url; }
-		if (url.startsWith("data:")) { return undefined; } // skip base64 placeholders
 		return this.BASE_URL + url;
 	},
 
 	// --- Search ---
 
 	async search(query, page = 1) {
+		// Try GET first — /search/{query} is the canonical search URL
 		let url = this.BASE_URL + "/search/" + encodeURIComponent(query);
 		if (page > 1) { url += "/page/" + page + "/"; }
 
-		const res = await cinder.fetch(url, {
-			headers: { "User-Agent": MOBILE_UA }
-		});
+		const res = await cinder.fetch(url, { headers: BROWSER_HEADERS });
 
+		// Surface the HTTP status so we can diagnose failures
 		if (res.status !== 200) {
-			cinder.error("BatCave search failed: " + res.status);
-			return [];
+			throw new Error("BatCave search HTTP " + res.status + " — site may be blocking requests");
+		}
+
+		// Check if we got a Cloudflare challenge page instead of real content
+		if (res.data && res.data.indexOf("readed__title") === -1) {
+			// Try POST fallback — same as the site's quicksearch form
+			const postRes = await cinder.fetch(this.BASE_URL + "/", {
+				method: "POST",
+				headers: Object.assign({}, BROWSER_HEADERS, {
+					"Content-Type": "application/x-www-form-urlencoded",
+				}),
+				body: "do=search&subaction=search&story=" + encodeURIComponent(query),
+			});
+
+			if (postRes.status === 200 && postRes.data && postRes.data.indexOf("readed__title") !== -1) {
+				return this._parseSeriesCards(postRes.data);
+			}
+
+			throw new Error("BatCave returned no results — got HTTP " + res.status + ", response length: " + (res.data ? res.data.length : 0));
 		}
 
 		return this._parseSeriesCards(res.data);
@@ -116,24 +132,18 @@ __cinderExport = {
 			url = this.BASE_URL + "/tags/marvel/page/" + p + "/";
 		}
 
-		const res = await cinder.fetch(url, {
-			headers: { "User-Agent": MOBILE_UA }
-		});
-
+		const res = await cinder.fetch(url, { headers: BROWSER_HEADERS });
 		if (res.status !== 200) { return []; }
 		return this._parseSeriesCards(res.data);
 	},
 
-	// Parse search/listing results.
-	// Actual HTML structure:
-	//   <h2 class="readed__title"><a href="https://batcave.biz/33758-batman-2025.html">Batman (2025-)</a></h2>
-	// Cover images use data-src (lazy loaded), not src.
+	// Parse search/listing result cards.
+	// Structure: <h2 class="readed__title"><a href="https://batcave.biz/ID-slug.html">Title</a></h2>
+	// Covers use data-src (lazy loaded), located before the <h2> in the DOM.
 	_parseSeriesCards(html) {
 		const results = [];
 		const seen = {};
 
-		// Extract titles and slugs from <h2 class="readed__title"> links
-		// These only appear in search/listing result cards
 		const titleMatches = this._matchAll(
 			html,
 			'<h2[^>]*class="[^"]*readed__title[^"]*"[^>]*>\\s*<a[^>]+href="https://batcave\\.biz/(\\d+-[^"]+)\\.html"[^>]*>([^<]+)<\\/a>',
@@ -141,17 +151,16 @@ __cinderExport = {
 		);
 
 		for (const m of titleMatches) {
-			const slug = m[1];   // e.g. "33758-batman-2025"
+			const slug = m[1];
 			const title = this._decode(m[2].trim());
 			if (!slug || !title || seen[slug]) { continue; }
 			seen[slug] = true;
 
-			// Cover is in the <a class="readed__img"> just BEFORE the <h2>
-			// Look backward from the title match position for data-src
+			// Cover is in the <a class="readed__img"> before the <h2>
 			const pos = html.indexOf(m[0]);
-			const lookback = html.substring(Math.max(0, pos - 500), pos);
-			const rawCover = this._match(lookback, 'data-src="([^"]+)"', "i", "");
-			const cover = this._absoluteUrl(rawCover);
+			const lookback = html.substring(Math.max(0, pos - 600), pos);
+			const rawCover = this._match(lookback, 'data-src="(/uploads/[^"]+)"', "i", "");
+			const cover = rawCover ? this.BASE_URL + rawCover : undefined;
 
 			results.push({
 				id: slug,
@@ -170,10 +179,7 @@ __cinderExport = {
 	async getMangaDetails(id) {
 		const url = this.BASE_URL + "/" + id + ".html";
 
-		const res = await cinder.fetch(url, {
-			headers: { "User-Agent": MOBILE_UA }
-		});
-
+		const res = await cinder.fetch(url, { headers: BROWSER_HEADERS });
 		if (res.status !== 200) {
 			throw new Error("Failed to fetch series: " + res.status);
 		}
@@ -184,12 +190,9 @@ __cinderExport = {
 			this._match(html, '<h1[^>]*>\\s*([^<]+?)\\s*<\\/h1>', "i", "Unknown")
 		);
 
-		// Cover: look for data-src in the poster/cover area
 		const rawCover =
-			this._match(html, '<img[^>]+class="[^"]*cover[^"]*"[^>]+data-src="([^"]+)"', "i", "") ||
-			this._match(html, '<img[^>]+data-src="([^"]+(?:cover|poster|mini)[^"]*)"', "i", "") ||
-			this._match(html, '<img[^>]+data-src="([^"]+\\.(?:jpg|jpeg|png|webp)[^"]*)"', "i", "");
-		const cover = this._absoluteUrl(rawCover);
+			this._match(html, 'data-src="(/uploads/[^"]+)"', "i", "");
+		const cover = rawCover ? this.BASE_URL + rawCover : undefined;
 
 		const descRaw =
 			this._match(html, '<div[^>]*class="[^"]*description[^"]*"[^>]*>([\\s\\S]*?)<\\/div>', "i", "") ||
@@ -199,7 +202,7 @@ __cinderExport = {
 		return {
 			id: id,
 			title: title,
-			cover: cover || undefined,
+			cover: cover,
 			description: description,
 		};
 	},
@@ -209,10 +212,7 @@ __cinderExport = {
 	async getChapters(seriesId) {
 		const url = this.BASE_URL + "/" + seriesId + ".html";
 
-		const res = await cinder.fetch(url, {
-			headers: { "User-Agent": MOBILE_UA }
-		});
-
+		const res = await cinder.fetch(url, { headers: BROWSER_HEADERS });
 		if (res.status !== 200) {
 			throw new Error("Failed to fetch series page: " + res.status);
 		}
@@ -224,7 +224,6 @@ __cinderExport = {
 		const chapters = [];
 		const numericSeriesId = this._numericId(seriesSlug);
 
-		// Chapter links: href="/reader/{numericId}/{chapterId}"
 		const rows = this._matchAll(
 			html,
 			'href="/reader/' + numericSeriesId + '/(\\d+)"[^>]*>([\\s\\S]*?)<\\/a>',
@@ -236,7 +235,6 @@ __cinderExport = {
 			const inner = row[2];
 			const rawText = this._decode(this._stripTags(inner)).replace(/\s+/g, " ").trim();
 
-			// Extract issue/chapter number
 			const numStr =
 				this._match(inner, '#([\\d.]+)', "i", "") ||
 				this._match(inner, 'Issue\\s+([\\d.]+)', "i", "") ||
@@ -245,7 +243,6 @@ __cinderExport = {
 
 			const chapterNumber = parseFloat(numStr) || 0;
 
-			// Store as "numericSeriesId/chapterId" so getPages can reconstruct the URL
 			chapters.push({
 				id: numericSeriesId + "/" + chapterId,
 				title: rawText || ("#" + numStr),
@@ -260,13 +257,9 @@ __cinderExport = {
 	// --- Pages ---
 
 	async getPages(chapterId) {
-		// chapterId = "numericSeriesId/chapterId"
 		const url = this.BASE_URL + "/reader/" + chapterId;
 
-		const res = await cinder.fetch(url, {
-			headers: { "User-Agent": MOBILE_UA }
-		});
-
+		const res = await cinder.fetch(url, { headers: BROWSER_HEADERS });
 		if (res.status !== 200) {
 			throw new Error("Failed to fetch reader: " + res.status);
 		}
@@ -278,7 +271,7 @@ __cinderExport = {
 		const pages = [];
 		const seen = {};
 
-		// DLE readers typically store images in a JS array variable
+		// DLE readers typically store images in a JS array
 		const jsArrayMatch = this._match(
 			html,
 			'(?:var\\s+)?(?:images|readerImages|pages|imagesList|imgs)\\s*=\\s*(\\[[^\\]]+\\])',
@@ -299,11 +292,10 @@ __cinderExport = {
 					}
 				}
 			} catch (e) {
-				// fall through to img tag scan
+				// fall through to img scan
 			}
 		}
 
-		// Fallback: scan for img tags
 		if (pages.length === 0) {
 			const matches = this._matchAll(
 				html,
@@ -322,8 +314,6 @@ __cinderExport = {
 
 		return pages;
 	},
-
-	// --- Settings ---
 
 	getSettings() {
 		return [];
