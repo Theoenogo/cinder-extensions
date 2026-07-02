@@ -7,13 +7,12 @@
 //   Reader:      https://batcave.biz/reader/{series_id}/{chapter_id}
 //   Browse:      https://batcave.biz/comix/page/{n}/
 
-// Mobile UA required — series pages return 401 without it
 const MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 
 __cinderExport = {
 	id: "batcave",
 	name: "BatCave",
-	version: "1.0.1",
+	version: "1.0.2",
 	icon: "🦇",
 	description: "Read western comics from BatCave.biz",
 	contentType: "comic",
@@ -60,19 +59,23 @@ __cinderExport = {
 		return str.replace(/<[^>]*>/g, "").trim();
 	},
 
-	// Series ID is the full slug WITHOUT .html, e.g. "30310-batman-some-title"
-	// This lets us reconstruct the URL directly without a secondary search.
-	// Numeric series ID (for reader URLs) is just the leading digits.
+	// Extract numeric series ID from slug e.g. "30310-batman" -> "30310"
 	_numericId(slug) {
 		const m = /^(\d+)/.exec(slug);
 		return m ? m[1] : slug;
 	},
 
+	// Make cover URL absolute
+	_absoluteUrl(url) {
+		if (!url) { return undefined; }
+		if (url.startsWith("http")) { return url; }
+		if (url.startsWith("data:")) { return undefined; } // skip base64 placeholders
+		return this.BASE_URL + url;
+	},
+
 	// --- Search ---
 
 	async search(query, page = 1) {
-		// Search URL: https://batcave.biz/search/{query}
-		// Pagination guess: https://batcave.biz/search/{query}/page/{n}/
 		let url = this.BASE_URL + "/search/" + encodeURIComponent(query);
 		if (page > 1) { url += "/page/" + page + "/"; }
 
@@ -92,10 +95,10 @@ __cinderExport = {
 
 	async getDiscoverSections() {
 		return [
-			{ id: "latest",  title: "Latest",     icon: "🆕" },
-			{ id: "popular", title: "Popular",     icon: "🔥" },
-			{ id: "dc",      title: "DC Comics",   icon: "🦇" },
-			{ id: "marvel",  title: "Marvel",      icon: "🕷️" },
+			{ id: "latest",  title: "Latest",   icon: "🆕" },
+			{ id: "popular", title: "Popular",   icon: "🔥" },
+			{ id: "dc",      title: "DC Comics", icon: "🦇" },
+			{ id: "marvel",  title: "Marvel",    icon: "🕷️" },
 		];
 	},
 
@@ -121,43 +124,39 @@ __cinderExport = {
 		return this._parseSeriesCards(res.data);
 	},
 
-	// Parse series cards from any listing or search page
+	// Parse search/listing results.
+	// Actual HTML structure:
+	//   <h2 class="readed__title"><a href="https://batcave.biz/33758-batman-2025.html">Batman (2025-)</a></h2>
+	// Cover images use data-src (lazy loaded), not src.
 	_parseSeriesCards(html) {
 		const results = [];
 		const seen = {};
 
-		// Match links: href="https://batcave.biz/30310-some-slug.html"
-		const links = this._matchAll(
+		// Extract titles and slugs from <h2 class="readed__title"> links
+		// These only appear in search/listing result cards
+		const titleMatches = this._matchAll(
 			html,
-			'href="https://batcave\\.biz/(\\d+-[^"]+)\\.html"',
+			'<h2[^>]*class="[^"]*readed__title[^"]*"[^>]*>\\s*<a[^>]+href="https://batcave\\.biz/(\\d+-[^"]+)\\.html"[^>]*>([^<]+)<\\/a>',
 			"gi"
 		);
 
-		for (const link of links) {
-			const slug = link[1]; // e.g. "30310-batman-the-dark-knight"
-			if (seen[slug]) { continue; }
+		for (const m of titleMatches) {
+			const slug = m[1];   // e.g. "33758-batman-2025"
+			const title = this._decode(m[2].trim());
+			if (!slug || !title || seen[slug]) { continue; }
 			seen[slug] = true;
 
-			const pos = html.indexOf(link[0]);
-			const chunk = html.substring(Math.max(0, pos - 300), pos + 800);
-
-			// Cover image
-			const cover = this._match(chunk, '<img[^>]+src="([^"]+)"', "i", "");
-
-			// Title — try alt text first, then headings
-			const title = this._decode(
-				this._match(chunk, '<img[^>]+alt="([^"]+)"', "i", "") ||
-				this._match(chunk, '<h[1-4][^>]*>\\s*([^<]+?)\\s*<\\/h[1-4]>', "i", "") ||
-				this._match(chunk, 'title="([^"]+)"', "i", "") ||
-				""
-			);
-
-			if (!title) { continue; }
+			// Cover is in the <a class="readed__img"> just BEFORE the <h2>
+			// Look backward from the title match position for data-src
+			const pos = html.indexOf(m[0]);
+			const lookback = html.substring(Math.max(0, pos - 500), pos);
+			const rawCover = this._match(lookback, 'data-src="([^"]+)"', "i", "");
+			const cover = this._absoluteUrl(rawCover);
 
 			results.push({
 				id: slug,
-				title: title.trim(),
-				cover: cover || undefined,
+				title: title,
+				cover: cover,
 				url: this.BASE_URL + "/" + slug + ".html",
 				format: "comic",
 			});
@@ -169,7 +168,6 @@ __cinderExport = {
 	// --- Series Details ---
 
 	async getMangaDetails(id) {
-		// id = slug like "30310-batman-some-title"
 		const url = this.BASE_URL + "/" + id + ".html";
 
 		const res = await cinder.fetch(url, {
@@ -186,10 +184,12 @@ __cinderExport = {
 			this._match(html, '<h1[^>]*>\\s*([^<]+?)\\s*<\\/h1>', "i", "Unknown")
 		);
 
-		const cover =
-			this._match(html, '<img[^>]+class="[^"]*cover[^"]*"[^>]+src="([^"]+)"', "i", "") ||
-			this._match(html, '<div[^>]*class="[^"]*poster[^"]*"[^>]*>[\\s\\S]*?<img[^>]+src="([^"]+)"', "i", "") ||
-			this._match(html, '<img[^>]+src="([^"]+(?:cover|poster|thumb)[^"]*)"', "i", "");
+		// Cover: look for data-src in the poster/cover area
+		const rawCover =
+			this._match(html, '<img[^>]+class="[^"]*cover[^"]*"[^>]+data-src="([^"]+)"', "i", "") ||
+			this._match(html, '<img[^>]+data-src="([^"]+(?:cover|poster|mini)[^"]*)"', "i", "") ||
+			this._match(html, '<img[^>]+data-src="([^"]+\\.(?:jpg|jpeg|png|webp)[^"]*)"', "i", "");
+		const cover = this._absoluteUrl(rawCover);
 
 		const descRaw =
 			this._match(html, '<div[^>]*class="[^"]*description[^"]*"[^>]*>([\\s\\S]*?)<\\/div>', "i", "") ||
@@ -207,7 +207,6 @@ __cinderExport = {
 	// --- Chapters ---
 
 	async getChapters(seriesId) {
-		// seriesId = slug like "30310-batman-some-title"
 		const url = this.BASE_URL + "/" + seriesId + ".html";
 
 		const res = await cinder.fetch(url, {
@@ -225,10 +224,10 @@ __cinderExport = {
 		const chapters = [];
 		const numericSeriesId = this._numericId(seriesSlug);
 
-		// Reader links: href="https://batcave.biz/reader/{numericId}/{chapterId}"
+		// Chapter links: href="/reader/{numericId}/{chapterId}"
 		const rows = this._matchAll(
 			html,
-			'href="https://batcave\\.biz/reader/' + numericSeriesId + '/(\\d+)"[^>]*>([\\s\\S]*?)<\\/a>',
+			'href="/reader/' + numericSeriesId + '/(\\d+)"[^>]*>([\\s\\S]*?)<\\/a>',
 			"gi"
 		);
 
@@ -237,7 +236,7 @@ __cinderExport = {
 			const inner = row[2];
 			const rawText = this._decode(this._stripTags(inner)).replace(/\s+/g, " ").trim();
 
-			// Try to extract issue/chapter number
+			// Extract issue/chapter number
 			const numStr =
 				this._match(inner, '#([\\d.]+)', "i", "") ||
 				this._match(inner, 'Issue\\s+([\\d.]+)', "i", "") ||
@@ -246,8 +245,7 @@ __cinderExport = {
 
 			const chapterNumber = parseFloat(numStr) || 0;
 
-			// Store chapter ID as "numericSeriesId/chapterId" so getPages
-			// can reconstruct the full reader URL without extra lookups
+			// Store as "numericSeriesId/chapterId" so getPages can reconstruct the URL
 			chapters.push({
 				id: numericSeriesId + "/" + chapterId,
 				title: rawText || ("#" + numStr),
@@ -262,7 +260,7 @@ __cinderExport = {
 	// --- Pages ---
 
 	async getPages(chapterId) {
-		// chapterId = "numericSeriesId/chapterId", e.g. "30310/74861"
+		// chapterId = "numericSeriesId/chapterId"
 		const url = this.BASE_URL + "/reader/" + chapterId;
 
 		const res = await cinder.fetch(url, {
@@ -280,7 +278,7 @@ __cinderExport = {
 		const pages = [];
 		const seen = {};
 
-		// DLE readers often store images in a JS array variable
+		// DLE readers typically store images in a JS array variable
 		const jsArrayMatch = this._match(
 			html,
 			'(?:var\\s+)?(?:images|readerImages|pages|imagesList|imgs)\\s*=\\s*(\\[[^\\]]+\\])',
@@ -305,16 +303,17 @@ __cinderExport = {
 			}
 		}
 
-		// Fallback: scan for <img> tags
+		// Fallback: scan for img tags
 		if (pages.length === 0) {
 			const matches = this._matchAll(
 				html,
-				'<img[^>]+src="(https?://[^"]+\\.(?:jpg|jpeg|png|webp)[^"]*)"',
+				'<img[^>]+(?:src|data-src)="(https?://[^"]+\\.(?:jpg|jpeg|png|webp)[^"]*)"',
 				"gi"
 			);
 			for (const m of matches) {
 				const imgUrl = m[1];
-				if (imgUrl.includes("/static/") || imgUrl.includes("logo") || imgUrl.includes("avatar")) { continue; }
+				if (imgUrl.includes("/static/") || imgUrl.includes("logo") ||
+				    imgUrl.includes("avatar") || imgUrl.includes("mini/")) { continue; }
 				if (seen[imgUrl]) { continue; }
 				seen[imgUrl] = true;
 				pages.push({ url: imgUrl });
