@@ -12,7 +12,7 @@ const BROWSER_HEADERS = {
 __cinderExport = {
 	id: "batcavebiz",
 	name: "BatCave",
-	version: "1.0.8",
+	version: "1.0.9",
 	icon: "🦇",
 	description: "Read western comics from BatCave.biz",
 	contentType: "comic",
@@ -67,55 +67,64 @@ __cinderExport = {
 	// --- Search ---
 
 	async search(query, page = 1) {
-		const q = encodeURIComponent(query);
+		// v1.0.9 DIAGNOSTIC BUILD
+		// Every endpoint 404s with an empty-title ~10KB page, which looks
+		// like an anti-bot interstitial. This build probes several URLs and
+		// reports what each response actually contains, one result per probe.
 
-		// URL variants to try in order. /search/{q} 404s from raw HTTP
-		// clients even though it works in Safari, so we probe the
-		// canonical DLE search endpoints too.
-		const variants = [
-			{ name: "pretty", url: this.BASE_URL + "/search/" + q, method: "GET" },
-			{ name: "slash", url: this.BASE_URL + "/search/" + q + "/", method: "GET" },
-			{ name: "index", url: this.BASE_URL + "/index.php?do=search&subaction=search&story=" + q, method: "GET" },
-			{ name: "form", url: this.BASE_URL + "/search/" + q + "?story=" + q + "&dosearch=Start+search", method: "GET" },
-			{ name: "post", url: this.BASE_URL + "/index.php?do=search", method: "POST", body: "do=search&subaction=search&story=" + q },
+		const q = encodeURIComponent(query);
+		const probes = [
+			{ name: "home", url: this.BASE_URL + "/" },
+			{ name: "comix", url: this.BASE_URL + "/comix/" },
+			{ name: "search", url: this.BASE_URL + "/search/" + q },
 		];
 
-		const attempts = [];
+		const out = [];
 
-		for (const v of variants) {
+		for (const p of probes) {
+			let info = p.name + " ";
 			try {
-				const opts = { headers: BROWSER_HEADERS };
-				if (v.method === "POST") {
-					opts.method = "POST";
-					opts.headers = {
-						"User-Agent": IOS_SAFARI_UA,
-						"Content-Type": "application/x-www-form-urlencoded",
-					};
-					opts.body = v.body;
-				}
-
-				const res = await cinder.fetch(v.url, opts);
+				const res = await cinder.fetch(p.url, { headers: BROWSER_HEADERS });
 				const body = res.data || "";
+				info += "s:" + res.status + " len:" + body.length;
 
-				if (res.status === 200 && body.indexOf("readed__title") !== -1) {
+				// If any probe actually returns real content, search works —
+				// parse and return it immediately
+				if (p.name === "search" && res.status === 200 && body.indexOf("readed__title") !== -1) {
 					return this._parseSeriesCards(body);
 				}
 
-				// Record status + page title for diagnostics
-				const pageTitle = this._match(body, "<title>([^<]*)<\\/title>", "i", "?").substring(0, 30);
-				attempts.push(v.name + ":" + res.status + "[" + pageTitle + "]");
+				// Detect known protection signatures
+				const lower = body.toLowerCase();
+				const sigs = [];
+				if (lower.indexOf("cloudflare") !== -1) { sigs.push("cf"); }
+				if (lower.indexOf("just a moment") !== -1) { sigs.push("cf-challenge"); }
+				if (lower.indexOf("ddos") !== -1) { sigs.push("ddos-guard"); }
+				if (lower.indexOf("captcha") !== -1) { sigs.push("captcha"); }
+				if (lower.indexOf("challenge") !== -1) { sigs.push("challenge"); }
+				if (lower.indexOf("turnstile") !== -1) { sigs.push("turnstile"); }
+				if (lower.indexOf("readed__title") !== -1) { sigs.push("REAL-CONTENT"); }
+				if (sigs.length > 0) { info += " [" + sigs.join(",") + "]"; }
+
+				// First chunk of visible body text
+				const noScripts = body.replace(new RegExp("<script[\\s\\S]*?</script>", "gi"), " ");
+				const noStyles = noScripts.replace(new RegExp("<style[\\s\\S]*?</style>", "gi"), " ");
+				const text = this._stripTags(noStyles).replace(/\s+/g, " ").trim().substring(0, 80);
+				info += " txt:" + (text || "(empty)");
 			} catch (e) {
-				attempts.push(v.name + ":ERR");
+				info += "ERR:" + (e && e.message ? e.message.substring(0, 50) : "?");
 			}
+
+			out.push({
+				id: "debug-" + p.name,
+				title: info,
+				cover: undefined,
+				url: p.url,
+				format: "comic",
+			});
 		}
 
-		return [{
-			id: "debug-info",
-			title: "DEBUG " + attempts.join(" "),
-			cover: undefined,
-			url: this.BASE_URL,
-			format: "comic",
-		}];
+		return out;
 	},
 
 	// --- Discover ---
