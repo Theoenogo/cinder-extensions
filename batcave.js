@@ -12,7 +12,7 @@ const BROWSER_HEADERS = {
 __cinderExport = {
 	id: "batcavebiz",
 	name: "BatCave",
-	version: "1.0.7",
+	version: "1.0.8",
 	icon: "🦇",
 	description: "Read western comics from BatCave.biz",
 	contentType: "comic",
@@ -67,44 +67,51 @@ __cinderExport = {
 	// --- Search ---
 
 	async search(query, page = 1) {
-		let url = this.BASE_URL + "/search/" + encodeURIComponent(query);
-		if (page > 1) { url += "/page/" + page + "/"; }
+		const q = encodeURIComponent(query);
 
-		let status1 = 0;
-		let len1 = 0;
+		// URL variants to try in order. /search/{q} 404s from raw HTTP
+		// clients even though it works in Safari, so we probe the
+		// canonical DLE search endpoints too.
+		const variants = [
+			{ name: "pretty", url: this.BASE_URL + "/search/" + q, method: "GET" },
+			{ name: "slash", url: this.BASE_URL + "/search/" + q + "/", method: "GET" },
+			{ name: "index", url: this.BASE_URL + "/index.php?do=search&subaction=search&story=" + q, method: "GET" },
+			{ name: "form", url: this.BASE_URL + "/search/" + q + "?story=" + q + "&dosearch=Start+search", method: "GET" },
+			{ name: "post", url: this.BASE_URL + "/index.php?do=search", method: "POST", body: "do=search&subaction=search&story=" + q },
+		];
 
-		try {
-			const res = await cinder.fetch(url, { headers: BROWSER_HEADERS });
-			status1 = res.status;
-			len1 = res.data ? res.data.length : 0;
+		const attempts = [];
 
-			if (res.status === 200 && res.data && res.data.indexOf("readed__title") !== -1) {
-				return this._parseSeriesCards(res.data);
+		for (const v of variants) {
+			try {
+				const opts = { headers: BROWSER_HEADERS };
+				if (v.method === "POST") {
+					opts.method = "POST";
+					opts.headers = {
+						"User-Agent": IOS_SAFARI_UA,
+						"Content-Type": "application/x-www-form-urlencoded",
+					};
+					opts.body = v.body;
+				}
+
+				const res = await cinder.fetch(v.url, opts);
+				const body = res.data || "";
+
+				if (res.status === 200 && body.indexOf("readed__title") !== -1) {
+					return this._parseSeriesCards(body);
+				}
+
+				// Record status + page title for diagnostics
+				const pageTitle = this._match(body, "<title>([^<]*)<\\/title>", "i", "?").substring(0, 30);
+				attempts.push(v.name + ":" + res.status + "[" + pageTitle + "]");
+			} catch (e) {
+				attempts.push(v.name + ":ERR");
 			}
-		} catch (e) {
-			status1 = -1;
 		}
 
-		// Second attempt: no custom headers at all (Cinder defaults)
-		let status2 = 0;
-		let len2 = 0;
-
-		try {
-			const res2 = await cinder.fetch(url, {});
-			status2 = res2.status;
-			len2 = res2.data ? res2.data.length : 0;
-
-			if (res2.status === 200 && res2.data && res2.data.indexOf("readed__title") !== -1) {
-				return this._parseSeriesCards(res2.data);
-			}
-		} catch (e) {
-			status2 = -1;
-		}
-
-		// Both failed — return diagnostics as a visible pseudo-result
 		return [{
 			id: "debug-info",
-			title: "DEBUG ios:" + status1 + "/" + len1 + " default:" + status2 + "/" + len2,
+			title: "DEBUG " + attempts.join(" "),
 			cover: undefined,
 			url: this.BASE_URL,
 			format: "comic",
