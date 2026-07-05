@@ -1,19 +1,22 @@
 // BatCave Extension for Cinder
 // Western comics from BatCave.biz
+//
+// v1.0.4 strategy notes:
+// - Cinder runs on iOS, so its TLS fingerprint is iOS/URLSession.
+//   Claiming to be desktop Chrome in the UA while having an iOS TLS
+//   fingerprint is a classic bot signal for Cloudflare. This version
+//   uses an honest iOS Safari UA (and a no-custom-headers attempt)
+//   so the UA matches the TLS fingerprint.
+// - If every fetch strategy fails, search returns a DEBUG pseudo-result
+//   showing the HTTP status of each attempt, since Cinder does not
+//   display thrown error messages.
 
-const DESKTOP_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
-
-const BROWSER_HEADERS = {
-	"User-Agent": DESKTOP_UA,
-	"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-	"Accept-Language": "en-US,en;q=0.9",
-	"Referer": "https://batcave.biz/",
-};
+const IOS_SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
 
 __cinderExport = {
 	id: "batcave",
 	name: "BatCave",
-	version: "1.0.3",
+	version: "1.0.4",
 	icon: "🦇",
 	description: "Read western comics from BatCave.biz",
 	contentType: "comic",
@@ -65,46 +68,88 @@ __cinderExport = {
 		return m ? m[1] : slug;
 	},
 
-	_absoluteUrl(url) {
-		if (!url) { return undefined; }
-		if (url.startsWith("data:")) { return undefined; }
-		if (url.startsWith("http")) { return url; }
-		return this.BASE_URL + url;
+	// Multi-strategy fetch.
+	// Tries, in order:
+	//   1. No custom headers at all (Cinder's native defaults — UA matches TLS)
+	//   2. iOS Safari UA (matches the device's TLS fingerprint)
+	//   3. iOS Safari UA + Accept/Language/Referer
+	// Returns { ok, data, attempts } where attempts is a debug string.
+	async _smartFetch(url, validator) {
+		const strategies = [
+			{ name: "default", opts: {} },
+			{ name: "ios-ua", opts: { headers: { "User-Agent": IOS_SAFARI_UA } } },
+			{
+				name: "ios-full",
+				opts: {
+					headers: {
+						"User-Agent": IOS_SAFARI_UA,
+						"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+						"Accept-Language": "en-US,en;q=0.9",
+						"Referer": "https://batcave.biz/",
+					}
+				}
+			},
+		];
+
+		const attempts = [];
+
+		for (const s of strategies) {
+			try {
+				const res = await cinder.fetch(url, s.opts);
+				const len = res.data ? res.data.length : 0;
+				const valid = res.status === 200 && (!validator || validator(res.data));
+				attempts.push(s.name + ":" + res.status + "/" + len + (valid ? "/OK" : ""));
+				if (valid) {
+					return { ok: true, data: res.data, attempts: attempts.join(" ") };
+				}
+			} catch (e) {
+				attempts.push(s.name + ":ERR(" + (e && e.message ? e.message.substring(0, 40) : "?") + ")");
+			}
+		}
+
+		return { ok: false, data: null, attempts: attempts.join(" ") };
 	},
 
 	// --- Search ---
 
 	async search(query, page = 1) {
-		// Try GET first — /search/{query} is the canonical search URL
 		let url = this.BASE_URL + "/search/" + encodeURIComponent(query);
 		if (page > 1) { url += "/page/" + page + "/"; }
 
-		const res = await cinder.fetch(url, { headers: BROWSER_HEADERS });
+		// A valid search results page contains the readed__title class
+		const result = await this._smartFetch(url, (html) => html && html.indexOf("readed__title") !== -1);
 
-		// Surface the HTTP status so we can diagnose failures
-		if (res.status !== 200) {
-			throw new Error("BatCave search HTTP " + res.status + " — site may be blocking requests");
+		if (result.ok) {
+			return this._parseSeriesCards(result.data);
 		}
 
-		// Check if we got a Cloudflare challenge page instead of real content
-		if (res.data && res.data.indexOf("readed__title") === -1) {
-			// Try POST fallback — same as the site's quicksearch form
+		// GET failed on all strategies — try the site's POST quicksearch form
+		try {
 			const postRes = await cinder.fetch(this.BASE_URL + "/", {
 				method: "POST",
-				headers: Object.assign({}, BROWSER_HEADERS, {
+				headers: {
+					"User-Agent": IOS_SAFARI_UA,
 					"Content-Type": "application/x-www-form-urlencoded",
-				}),
+				},
 				body: "do=search&subaction=search&story=" + encodeURIComponent(query),
 			});
-
 			if (postRes.status === 200 && postRes.data && postRes.data.indexOf("readed__title") !== -1) {
 				return this._parseSeriesCards(postRes.data);
 			}
-
-			throw new Error("BatCave returned no results — got HTTP " + res.status + ", response length: " + (res.data ? res.data.length : 0));
+			result.attempts += " POST:" + postRes.status + "/" + (postRes.data ? postRes.data.length : 0);
+		} catch (e) {
+			result.attempts += " POST:ERR";
 		}
 
-		return this._parseSeriesCards(res.data);
+		// Everything failed. Surface diagnostics as a pseudo-result since
+		// Cinder does not display thrown error messages.
+		return [{
+			id: "debug-info",
+			title: "DEBUG: " + result.attempts,
+			cover: undefined,
+			url: this.BASE_URL,
+			format: "comic",
+		}];
 	},
 
 	// --- Discover ---
@@ -132,18 +177,21 @@ __cinderExport = {
 			url = this.BASE_URL + "/tags/marvel/page/" + p + "/";
 		}
 
-		const res = await cinder.fetch(url, { headers: BROWSER_HEADERS });
-		if (res.status !== 200) { return []; }
-		return this._parseSeriesCards(res.data);
+		const result = await this._smartFetch(url, (html) => html && html.length > 5000);
+		if (!result.ok) { return []; }
+		return this._parseSeriesCards(result.data);
 	},
 
 	// Parse search/listing result cards.
-	// Structure: <h2 class="readed__title"><a href="https://batcave.biz/ID-slug.html">Title</a></h2>
-	// Covers use data-src (lazy loaded), located before the <h2> in the DOM.
+	// <h2 class="readed__title"><a href="https://batcave.biz/ID-slug.html">Title</a></h2>
+	// Covers are lazy-loaded via data-src, appearing before the h2.
+	// Catalogue pages may use a different card layout, so we also
+	// fall back to generic series-link extraction.
 	_parseSeriesCards(html) {
 		const results = [];
 		const seen = {};
 
+		// Primary: search result cards
 		const titleMatches = this._matchAll(
 			html,
 			'<h2[^>]*class="[^"]*readed__title[^"]*"[^>]*>\\s*<a[^>]+href="https://batcave\\.biz/(\\d+-[^"]+)\\.html"[^>]*>([^<]+)<\\/a>',
@@ -156,7 +204,6 @@ __cinderExport = {
 			if (!slug || !title || seen[slug]) { continue; }
 			seen[slug] = true;
 
-			// Cover is in the <a class="readed__img"> before the <h2>
 			const pos = html.indexOf(m[0]);
 			const lookback = html.substring(Math.max(0, pos - 600), pos);
 			const rawCover = this._match(lookback, 'data-src="(/uploads/[^"]+)"', "i", "");
@@ -171,6 +218,42 @@ __cinderExport = {
 			});
 		}
 
+		// Fallback: generic extraction for catalogue/tag pages with
+		// different card markup (e.g. "popular" sidebar-style cards)
+		if (results.length === 0) {
+			const links = this._matchAll(
+				html,
+				'<a[^>]+href="https://batcave\\.biz/(\\d+-[^"]+)\\.html"[^>]*>([\\s\\S]{0,900}?)<\\/a>',
+				"gi"
+			);
+
+			for (const link of links) {
+				const slug = link[1];
+				const inner = link[2];
+				if (seen[slug]) { continue; }
+
+				const title = this._decode(
+					this._match(inner, 'alt="([^"]+)"', "i", "") ||
+					this._match(inner, '<div[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<', "i", "") ||
+					this._stripTags(inner).substring(0, 80).trim()
+				);
+
+				if (!title || title.length < 2) { continue; }
+				seen[slug] = true;
+
+				const rawCover = this._match(inner, 'data-src="(/uploads/[^"]+)"', "i", "");
+				const cover = rawCover ? this.BASE_URL + rawCover : undefined;
+
+				results.push({
+					id: slug,
+					title: title,
+					cover: cover,
+					url: this.BASE_URL + "/" + slug + ".html",
+					format: "comic",
+				});
+			}
+		}
+
 		return results;
 	},
 
@@ -179,19 +262,18 @@ __cinderExport = {
 	async getMangaDetails(id) {
 		const url = this.BASE_URL + "/" + id + ".html";
 
-		const res = await cinder.fetch(url, { headers: BROWSER_HEADERS });
-		if (res.status !== 200) {
-			throw new Error("Failed to fetch series: " + res.status);
+		const result = await this._smartFetch(url, (html) => html && html.indexOf("<h1") !== -1);
+		if (!result.ok) {
+			throw new Error("Failed to fetch series page (" + result.attempts + ")");
 		}
 
-		const html = res.data;
+		const html = result.data;
 
 		const title = this._decode(
 			this._match(html, '<h1[^>]*>\\s*([^<]+?)\\s*<\\/h1>', "i", "Unknown")
 		);
 
-		const rawCover =
-			this._match(html, 'data-src="(/uploads/[^"]+)"', "i", "");
+		const rawCover = this._match(html, 'data-src="(/uploads/[^"]+)"', "i", "");
 		const cover = rawCover ? this.BASE_URL + rawCover : undefined;
 
 		const descRaw =
@@ -212,21 +294,22 @@ __cinderExport = {
 	async getChapters(seriesId) {
 		const url = this.BASE_URL + "/" + seriesId + ".html";
 
-		const res = await cinder.fetch(url, { headers: BROWSER_HEADERS });
-		if (res.status !== 200) {
-			throw new Error("Failed to fetch series page: " + res.status);
+		const result = await this._smartFetch(url, (html) => html && html.indexOf("/reader/") !== -1);
+		if (!result.ok) {
+			throw new Error("Failed to fetch chapters (" + result.attempts + ")");
 		}
 
-		return this._parseChapterList(res.data, seriesId);
+		return this._parseChapterList(result.data, seriesId);
 	},
 
 	_parseChapterList(html, seriesSlug) {
 		const chapters = [];
 		const numericSeriesId = this._numericId(seriesSlug);
 
+		// Match both relative and absolute reader links, and skip "/first"
 		const rows = this._matchAll(
 			html,
-			'href="/reader/' + numericSeriesId + '/(\\d+)"[^>]*>([\\s\\S]*?)<\\/a>',
+			'href="(?:https://batcave\\.biz)?/reader/' + numericSeriesId + '/(\\d+)[^"]*"[^>]*>([\\s\\S]*?)<\\/a>',
 			"gi"
 		);
 
@@ -259,30 +342,28 @@ __cinderExport = {
 	async getPages(chapterId) {
 		const url = this.BASE_URL + "/reader/" + chapterId;
 
-		const res = await cinder.fetch(url, { headers: BROWSER_HEADERS });
-		if (res.status !== 200) {
-			throw new Error("Failed to fetch reader: " + res.status);
+		const result = await this._smartFetch(url, (html) => html && html.length > 3000);
+		if (!result.ok) {
+			throw new Error("Failed to fetch reader (" + result.attempts + ")");
 		}
 
-		return this._parsePages(res.data);
+		return this._parsePages(result.data);
 	},
 
 	_parsePages(html) {
 		const pages = [];
 		const seen = {};
 
-		// DLE readers typically store images in a JS array
-		const jsArrayMatch = this._match(
-			html,
-			'(?:var\\s+)?(?:images|readerImages|pages|imagesList|imgs)\\s*=\\s*(\\[[^\\]]+\\])',
-			"i",
-			""
-		);
+		// Reader is a Vue app with data in window.__DATA__ — try that first
+		// e.g. window.__DATA__ = {...,"images":["/uploads/...","..."],...}
+		const dataBlock = this._match(html, 'window\\.__DATA__\\s*=\\s*(\\{[\\s\\S]*?\\});?\\s*<\\/script>', "i", "") ||
+		                  this._match(html, 'window\\.__DATA__\\s*=\\s*(\\{[\\s\\S]*?\\})\\s*[;\\n]', "i", "");
 
-		if (jsArrayMatch) {
+		if (dataBlock) {
 			try {
-				const urls = JSON.parse(jsArrayMatch);
-				for (const u of urls) {
+				const data = JSON.parse(dataBlock);
+				const imgs = data.images || (data.chapter && data.chapter.images) || [];
+				for (const u of imgs) {
 					if (typeof u === "string" && u.length > 5) {
 						const imgUrl = u.startsWith("http") ? u : this.BASE_URL + u;
 						if (!seen[imgUrl]) {
@@ -292,20 +373,52 @@ __cinderExport = {
 					}
 				}
 			} catch (e) {
-				// fall through to img scan
+				// JSON parse failed — extract image paths from the raw block instead
+				const rawImgs = this._matchAll(dataBlock, '"(\\/uploads\\/[^"]+\\.(?:jpg|jpeg|png|webp)[^"]*)"', "gi");
+				for (const m of rawImgs) {
+					const imgUrl = this.BASE_URL + m[1].replace(/\\\//g, "/");
+					if (!seen[imgUrl]) {
+						seen[imgUrl] = true;
+						pages.push({ url: imgUrl });
+					}
+				}
 			}
 		}
 
+		// Fallback 1: any JS array of images
+		if (pages.length === 0) {
+			const jsArrayMatch = this._match(
+				html,
+				'(?:var\\s+)?(?:images|readerImages|pages|imagesList|imgs)\\s*[=:]\\s*(\\[[^\\]]+\\])',
+				"i",
+				""
+			);
+			if (jsArrayMatch) {
+				const rawImgs = this._matchAll(jsArrayMatch, '"([^"]+\\.(?:jpg|jpeg|png|webp)[^"]*)"', "gi");
+				for (const m of rawImgs) {
+					let u = m[1].replace(/\\\//g, "/");
+					const imgUrl = u.startsWith("http") ? u : this.BASE_URL + u;
+					if (!seen[imgUrl]) {
+						seen[imgUrl] = true;
+						pages.push({ url: imgUrl });
+					}
+				}
+			}
+		}
+
+		// Fallback 2: img tags
 		if (pages.length === 0) {
 			const matches = this._matchAll(
 				html,
-				'<img[^>]+(?:src|data-src)="(https?://[^"]+\\.(?:jpg|jpeg|png|webp)[^"]*)"',
+				'<img[^>]+(?:src|data-src)="((?:https?://[^"]+|/uploads/[^"]+)\\.(?:jpg|jpeg|png|webp)[^"]*)"',
 				"gi"
 			);
 			for (const m of matches) {
-				const imgUrl = m[1];
+				let u = m[1];
+				const imgUrl = u.startsWith("http") ? u : this.BASE_URL + u;
 				if (imgUrl.includes("/static/") || imgUrl.includes("logo") ||
-				    imgUrl.includes("avatar") || imgUrl.includes("mini/")) { continue; }
+				    imgUrl.includes("avatar") || imgUrl.includes("mini/") ||
+				    imgUrl.includes("noavatar") || imgUrl.includes("fotos/")) { continue; }
 				if (seen[imgUrl]) { continue; }
 				seen[imgUrl] = true;
 				pages.push({ url: imgUrl });
