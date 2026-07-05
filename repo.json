@@ -12,9 +12,9 @@
 			"minCinderVersion": "2.0.0"
 		},
 		{
-			"id": "batcave",
+			"id": "batcavebiz",
 			"name": "BatCave",
-			"version": "1.0.6",
+			"version": "1.0.7",
 			"description": "Read western comics from BatCave.biz",
 			"contentType": "comic",
 			"scriptUrl": "https://raw.githubusercontent.com/Theoenogo/cinder-extensions/main/batcave.js",
