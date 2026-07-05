@@ -10,9 +10,9 @@ const BROWSER_HEADERS = {
 };
 
 __cinderExport = {
-	id: "batcave",
+	id: "batcavebiz",
 	name: "BatCave",
-	version: "1.0.6",
+	version: "1.0.7",
 	icon: "🦇",
 	description: "Read western comics from BatCave.biz",
 	contentType: "comic",
